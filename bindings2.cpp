@@ -1,21 +1,22 @@
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h> // Essencial: converte list do Python para std::vector do C++
+#include <pybind11/stl.h> 
 #include <map>
 #include <string>
 #include <vector>
 #include <iostream>
 #include <fstream>
+#include <iomanip> // Para setprecision
 #include <stdexcept>
 
 // Define a flag para desativar o main() dentro do imm.cpp
 #define PYBIND_MODE
 
-// Inclui o código fonte principal
+// Inclui o código fonte principal (dá acesso ao MonteCarlo_IC, OpenMP, etc.)
 #include "imm.cpp" 
 
 namespace py = pybind11;
 
-// Wrapper atualizado com o parametro universe_file
+// Wrapper original do IMM mantido intacto
 void run_algorithm(std::string graph_path, int k, std::string model, double eps, int numMC, std::string universe_file) {
     std::map<std::string, std::string> args;
     args["graph"] = graph_path;
@@ -32,9 +33,10 @@ void run_algorithm(std::string graph_path, int k, std::string model, double eps,
     run(args);
 }
 
-// NOVO: Wrapper para rodar apenas o Monte Carlo passando uma lista de sementes
+// NOVO: Wrapper independente para Monte Carlo com Barra de Progresso
 double evaluate_seeds_wrapper(std::string graph_path, std::vector<int> S, std::string model, int numMC) {
-    // 1. Leitura do Grafo (focada apenas na estrutura direta 'es' para propagação)
+    
+    // 1. Leitura do Grafo (Focada na construção da estrutura 'es' para Monte Carlo)
     std::ifstream is(graph_path.c_str());
     if (!is.is_open()) {
         throw std::runtime_error("Erro fatal: Nao foi possivel abrir o arquivo do grafo.");
@@ -57,35 +59,60 @@ double evaluate_seeds_wrapper(std::string graph_path, std::vector<int> S, std::s
         es[e.u].push_back(e);
     }
     
-    // Libera a memória da lista bruta
     {
         std::vector<edge> empty;
-        ps.swap(empty);
+        ps.swap(empty); // Libera memória da lista bruta
     }
 
-    // 2. Simulação Monte Carlo Paralela (idêntica à do imm.cpp)
-    double total_inf = 0.0;
+    std::cout << "\n[Monte Carlo Independente] Avaliando " << S.size() << " sementes..." << std::endl;
 
-    #pragma omp parallel
+    // 2. Simulação Monte Carlo Paralela com Barra de Progresso
+    double total_inf = 0.0;
+    double global_running_spread = 0.0;
+    int progress_counter = 0;
+
+#pragma omp parallel
     {
         unsigned long seed = (unsigned long)(time(NULL) ^ (omp_get_thread_num() * 99999));
         std::mt19937 gen(seed);
         double local_inf = 0;
 
-        #pragma omp for
+#pragma omp for
         for (int sim = 0; sim < numMC; sim++) {
+            int result = 0;
+
             if (model == "tvic" || model == "ic") {
-                local_inf += MonteCarlo_IC(V, es, S, gen);
+                result = MonteCarlo_IC(V, es, S, gen);
             }
             else if (model == "tvlt" || model == "lt") {
-                local_inf += MonteCarlo_LT(V, es, S, gen);
+                result = MonteCarlo_LT(V, es, S, gen);
+            }
+
+            local_inf += result;
+
+#pragma omp atomic
+            global_running_spread += result;
+
+#pragma omp atomic
+            progress_counter++;
+
+            // Atualiza a barra de progresso no console
+            if (progress_counter % 100 == 0 || progress_counter == numMC) {
+#pragma omp critical
+                {
+                    double current_avg = global_running_spread / progress_counter;
+                    std::cout << "\rProgresso: " << progress_counter << "/" << numMC
+                        << " (" << (int)(100.0 * progress_counter / numMC) << "%) "
+                        << "| Spread Est.: " << std::fixed << std::setprecision(2) << current_avg << "   " << std::flush;
+                }
             }
         }
 
-        #pragma omp atomic
+#pragma omp atomic
         total_inf += local_inf;
     }
 
+    std::cout << std::endl; // Quebra de linha limpa após a barra concluir
     return total_inf / numMC;
 }
 
@@ -99,13 +126,13 @@ PYBIND11_MODULE(imm_module, m) {
         py::arg("model"),
         py::arg("eps"),
         py::arg("numMC"),
-        py::arg("universe_file") = "");
+        py::arg("universe_file") = ""); 
 
     // NOVO: Expondo a função de avaliação independente
     m.def("evaluate_seeds", &evaluate_seeds_wrapper,
         "Avalia o spread de um conjunto customizado de sementes via Monte Carlo",
         py::arg("graph_path"),
-        py::arg("seeds"), // Recebe uma lista Python, pybind converte para std::vector<int>
+        py::arg("seeds"), // Recebe uma list do Python
         py::arg("model"),
         py::arg("numMC"));
 }
